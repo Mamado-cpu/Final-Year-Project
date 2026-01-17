@@ -19,116 +19,75 @@ const authController = {
                 role, 
                 username, 
                 twoFactorEnabled, 
-                twoFactorMethod 
+                twoFactorMethod,
+                vehicleNumber,
+                vehicleType
             } = req.body;
 
+            // Log incoming request data for debugging
+            console.log('Register request body:', req.body);
+
+            // Log validation failures
             if (!username || !password) {
+                console.error('Validation failed: Username and password are required');
                 return res.status(400).json({ message: 'Username and password are required' });
             }
-            if (!email && !phone) {
-                return res.status(400).json({ message: 'Provide either email or phone' });
+            if (!email) {
+                console.error('Validation failed: Email is required');
+                return res.status(400).json({ message: 'Email is required for verification' });
             }
 
+            // Check for existing users
             const existingUsername = await User.findOne({ username });
             if (existingUsername) return res.status(400).json({ message: 'Username already taken' });
-            if (email) {
-                const existingEmail = await User.findOne({ email });
-                if (existingEmail) return res.status(400).json({ message: 'Email already registered' });
-            }
-            if (phone) {
-                const existingPhone = await User.findOne({ phone });
-                if (existingPhone) return res.status(400).json({ message: 'Phone already registered' });
-            }
+            const existingEmail = await User.findOne({ email });
+            if (existingEmail) return res.status(400).json({ message: 'Email already registered' });
 
             const salt = await bcrypt.genSalt(10);
-            const hashed = await bcrypt.hash(password, salt);
-                  
+            const hashedPassword = await bcrypt.hash(password, salt);
+            const code = generateCode();
+            const hashedCode = await bcrypt.hash(code, 10);
 
             const allowedRoles = ['resident', 'collector', 'admin'];
             const finalRole = allowedRoles.includes(role) ? role : 'resident';
 
-            const user = new User({
+            // Prepare user data (don't save yet)
+            const userData = {
                 username,
-                email: email || undefined,
-                password: hashed,
+                email,
+                password: hashedPassword,
                 fullName: fullName || '',
                 roles: [finalRole],
                 phone: phone || undefined,
                 twoFactorEnabled: !!twoFactorEnabled,
-                twoFactorMethod: twoFactorMethod || (email ? 'email' : (phone ? 'phone' : undefined))
-            });
+                twoFactorMethod: 'email',
+                isVerified: false, // Will be set to true after verification
+                vehicleNumber: vehicleNumber || undefined,
+                vehicleType: vehicleType || undefined
+            };
 
-            await user.save();
-            console.log('REGISTER ROLE:', finalRole);
-            console.log('DB ROLES:', user.roles);
-
-            // If registering as collector, create collector profile (vehicle fields optional)
-            if (finalRole === 'collector') {
-                const Collector = require('../models/Collector');
-                try {
-                    const collector = new Collector({
-                        userId: user._id,
-                        fullName: fullName || user.fullName || '',
-                        username: username || user.username || '',
-                        email: email || user.email || undefined,
-                        phone: phone || user.phone || undefined,
-                        vehicleNumber: req.body.vehicleNumber || undefined,
-                        vehicleType: req.body.vehicleType || undefined,
-                        isAvailable: true
-                    });
-                    await collector.save();
-                } catch (err) {
-                    console.error('Failed to create collector profile during registration:', err && err.stack ? err.stack : err);
-                    // cleanup user
-                    try { await User.findByIdAndDelete(user._id); } catch (e) { console.error('Cleanup failed', e); }
-                    return res.status(500).json({ message: 'Failed to create collector profile', error: err.message || String(err) });
-                }
-            }
-                // If registering as collector ensure roles include collector and create profile handled elsewhere
-                try {
-                    if (finalRole === 'collector') {
-                        if (!user.roles || !user.roles.includes('collector')) {
-                            user.roles = Array.from(new Set([...(user.roles || []), 'collector']));
-                            await User.findByIdAndUpdate(user._id, { roles: user.roles });
-                            console.log('Registered user roles enforced to include collector:', user._id.toString());
-                        }
-                    }
-                } catch (e) {
-                    console.error('Failed to enforce collector role during registration:', e && e.message ? e.message : e);
-                }
-            // If user enabled two-factor, don't issue full token yet — send OTP and return a temp token
-            if (user.twoFactorEnabled) {
-                const code = generateCode();
-                const hashedCode = await bcrypt.hash(code, 10);
-                user.twoFactorCode = hashedCode;
-                user.twoFactorExpires = Date.now() + 5 * 60 * 1000; // 5 minutes
-                user.twoFactorLastSent = Date.now();
-                await user.save();
-
-                try {
-                    const method = user.twoFactorMethod || (user.email ? 'email' : (user.phone ? 'phone' : 'email'));
-                    await sendOtp(user, code, method);
-                } catch (e) {
-                    console.error('Failed to send OTP during registration:', e && e.message ? e.message : e);
-                }
-
-                const tempToken = jwt.sign({ twoFactor: true, userId: user._id }, process.env.JWT_SECRET, { expiresIn: '10m' });
-                return res.status(200).json({ twoFactorRequired: true, tempToken, twoFactorMethod: user.twoFactorMethod });
+            // Allow collectors to register independently
+            if (role === 'collector') {
+                userData.isVerified = true; // Automatically verify collectors for now
             }
 
-            const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, { expiresIn: '24h' });
+            // Send OTP
+            try {
+                await sendOtp({ email }, code, 'email');
+            } catch (e) {
+                console.error('Failed to send OTP during registration:', e && e.message ? e.message : e);
+                return res.status(500).json({ message: 'Failed to send verification email' });
+            }
 
-            res.status(201).json({
-                token,
-                user: {
-                    id: user._id,
-                    username: user.username,
-                    email: user.email,
-                    fullName: user.fullName,
-                    isApproved: user.isApproved,
-                    roles: user.roles
-                }
-            });
+            // Create temp token with user data and verification code
+            const tempToken = jwt.sign({ 
+                twoFactor: true, 
+                userData,
+                verificationCode: hashedCode,
+                expires: Date.now() + 5 * 60 * 1000 // 5 minutes
+            }, process.env.JWT_SECRET, { expiresIn: '10m' });
+
+            return res.status(200).json({ twoFactorRequired: true, tempToken, twoFactorMethod: 'email' });
         } catch (error) {
             res.status(500).json({ message: 'Server error', error: error.message });
         }
@@ -146,23 +105,74 @@ const authController = {
             } catch (e) {
                 return res.status(401).json({ message: 'Invalid or expired temp token' });
             }
-            if (!payload || !payload.twoFactor || !payload.userId) return res.status(401).json({ message: 'Invalid temp token' });
+            if (!payload || !payload.twoFactor) return res.status(401).json({ message: 'Invalid temp token' });
 
-            const user = await User.findById(payload.userId);
-            if (!user) return res.status(404).json({ message: 'User not found' });
-            if (!user.twoFactorCode || !user.twoFactorExpires) return res.status(400).json({ message: 'No pending 2FA' });
-            if (Date.now() > user.twoFactorExpires) return res.status(410).json({ message: '2FA code expired' });
+            // Check if it's old format (userId) or new format (userData)
+            if (payload.userId) {
+                // Old format: user exists, just verify
+                const user = await User.findById(payload.userId);
+                if (!user) return res.status(404).json({ message: 'User not found' });
+                if (!user.twoFactorCode || !user.twoFactorExpires) return res.status(400).json({ message: 'No pending 2FA' });
+                if (Date.now() > user.twoFactorExpires) return res.status(410).json({ message: '2FA code expired' });
 
-            const matches = await bcrypt.compare(code, user.twoFactorCode || '');
-            if (!matches) return res.status(401).json({ message: 'Invalid code' });
+                const matches = await bcrypt.compare(code, user.twoFactorCode || '');
+                if (!matches) return res.status(401).json({ message: 'Invalid code' });
 
-            // clear 2FA and issue full token
-            user.twoFactorCode = undefined;
-            user.twoFactorExpires = undefined;
-            await user.save();
+                // clear 2FA and issue full token
+                user.twoFactorCode = undefined;
+                user.twoFactorExpires = undefined;
+                user.isVerified = true;
+                await user.save();
 
-            const fullToken = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, { expiresIn: '24h' });
-            res.json({ token: fullToken, user: { id: user._id, username: user.username, email: user.email, roles: user.roles } });
+                const fullToken = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, { expiresIn: '24h' });
+                res.json({ token: fullToken, user: { id: user._id, username: user.username, email: user.email, roles: user.roles } });
+            } else if (payload.userData && payload.verificationCode) {
+                // New format: create user after verification
+                if (Date.now() > payload.expires) return res.status(410).json({ message: 'Verification code expired' });
+
+                const matches = await bcrypt.compare(code, payload.verificationCode);
+                if (!matches) return res.status(401).json({ message: 'Invalid code' });
+
+                // Create the user
+                const user = new User(payload.userData);
+                await user.save();
+
+                // Set verified after creation
+                user.isVerified = true;
+                await user.save();
+
+                // If registering as collector, create collector profile
+                if (user.roles.includes('collector')) {
+                    const Collector = require('../models/Collector');
+                    try {
+                        const collector = new Collector({
+                            userId: user._id,
+                            fullName: user.fullName,
+                            username: user.username,
+                            email: user.email,
+                            phone: user.phone,
+                            vehicleNumber: payload.userData.vehicleNumber,
+                            vehicleType: payload.userData.vehicleType,
+                            isAvailable: true
+                        });
+                        await collector.save();
+                    } catch (err) {
+                        console.error('Failed to create collector profile:', err);
+                        // Cleanup user
+                        try { await User.findByIdAndDelete(user._id); } catch (e) { console.error('Cleanup failed', e); }
+                        return res.status(500).json({ message: 'Failed to create collector profile' });
+                    }
+                }
+
+                const fullToken = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, { expiresIn: '24h' });
+                let redirectTo = '/';
+                if (user.roles.includes('admin')) redirectTo = '/admin';
+                else if (user.roles.includes('collector')) redirectTo = '/collector';
+                else if (user.roles.includes('resident')) redirectTo = '/resident';
+                res.json({ token: fullToken, user: { id: user._id, username: user.username, email: user.email, roles: user.roles }, redirectTo });
+            } else {
+                return res.status(401).json({ message: 'Invalid temp token' });
+            }
         } catch (error) {
             res.status(500).json({ message: 'Server error', error: error.message });
         }
@@ -182,38 +192,62 @@ const authController = {
             } catch (e) {
                 return res.status(401).json({ message: 'Invalid or expired temp token' });
             }
-            if (!payload || !payload.twoFactor || !payload.userId) return res.status(401).json({ message: 'Invalid temp token' });
+            if (!payload || !payload.twoFactor) return res.status(401).json({ message: 'Invalid temp token' });
 
-            const user = await User.findById(payload.userId);
-            if (!user) return res.status(404).json({ message: 'User not found' });
-            if (!user.twoFactorEnabled) return res.status(400).json({ message: '2FA not enabled for user' });
+            let userEmail = '';
+            let userId = null;
 
-            const COOLDOWN_MS = 60 * 1000; // 60 seconds
-            const last = user.twoFactorLastSent || 0;
-            const since = Date.now() - last;
-            if (last && since < COOLDOWN_MS) {
-                const wait = Math.ceil((COOLDOWN_MS - since) / 1000);
-                return res.status(429).json({ message: 'Too many requests', retryAfter: wait });
+            if (payload.userId) {
+                // Old format
+                const user = await User.findById(payload.userId);
+                if (!user) return res.status(404).json({ message: 'User not found' });
+                userEmail = user.email;
+                userId = user._id;
+            } else if (payload.userData) {
+                // New format
+                userEmail = payload.userData.email;
+            } else {
+                return res.status(401).json({ message: 'Invalid temp token' });
             }
 
-            // generate new code and send
+            // Enforce cooldown (only for existing users)
+            if (userId) {
+                const user = await User.findById(userId);
+                const COOLDOWN_MS = 60 * 1000; // 60 seconds
+                const last = user.twoFactorLastSent || 0;
+                const since = Date.now() - last;
+                if (last && since < COOLDOWN_MS) {
+                    const wait = Math.ceil((COOLDOWN_MS - since) / 1000);
+                    return res.status(429).json({ message: 'Too many requests', retryAfter: wait });
+                }
+                user.twoFactorLastSent = Date.now();
+                await user.save();
+            }
+
+            // generate new code
             const code = generateCode();
             const hashedCode = await bcrypt.hash(code, 10);
-            user.twoFactorCode = hashedCode;
-            user.twoFactorExpires = Date.now() + 5 * 60 * 1000; // 5 minutes
-            user.twoFactorLastSent = Date.now();
-            await user.save();
 
+            // Send OTP
             try {
-                const method = user.twoFactorMethod || (user.email ? 'email' : (user.phone ? 'phone' : 'email'));
-                await sendOtp(user, code, method);
+                await sendOtp({ email: userEmail }, code, 'email');
             } catch (e) {
                 console.error('Failed to resend OTP:', e && e.message ? e.message : e);
+                return res.status(500).json({ message: 'Failed to send verification email' });
             }
 
-            // extend temp token validity a bit by issuing a fresh temp token
-            const newTemp = jwt.sign({ twoFactor: true, userId: user._id }, process.env.JWT_SECRET, { expiresIn: '10m' });
-            return res.json({ ok: true, twoFactorRequired: true, tempToken: newTemp, twoFactorMethod: user.twoFactorMethod });
+            // For new format, create new temp token with updated code
+            let newTempToken = tempToken;
+            if (payload.userData) {
+                newTempToken = jwt.sign({ 
+                    twoFactor: true, 
+                    userData: payload.userData,
+                    verificationCode: hashedCode,
+                    expires: Date.now() + 5 * 60 * 1000
+                }, process.env.JWT_SECRET, { expiresIn: '10m' });
+            }
+
+            return res.json({ ok: true, twoFactorRequired: true, tempToken: newTempToken, twoFactorMethod: 'email' });
         } catch (error) {
             res.status(500).json({ message: 'Server error', error: error.message });
         }
@@ -237,6 +271,8 @@ const authController = {
             console.log('Login user roles:', user ? user.roles : null);
 
             if (!user) return res.status(401).json({ message: 'Invalid credentials' });
+
+            if (!user.isVerified) return res.status(403).json({ message: 'Account not verified. Please complete signup verification.' });
 
             const isMatch = await bcrypt.compare(password, user.password || '');
             if (!isMatch) return res.status(401).json({ message: 'Invalid credentials' });
@@ -266,7 +302,7 @@ const authController = {
 
                 // send code (prefer email when available)
                 try {
-                    const method = user.twoFactorMethod || (user.email ? 'email' : (user.phone ? 'phone' : 'email'));
+                    const method = user.email ? 'email' : 'email';
                     await sendOtp(user, code, method);
                 } catch (e) {
                     console.error('Failed to send OTP:', e.message || e);

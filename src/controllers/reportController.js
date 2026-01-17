@@ -1,10 +1,25 @@
 const Report = require('../models/Report');
+const multer = require('multer');
+const path = require('path');
+
+// Configure multer for file uploads
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, 'uploads/'); // Save files to the 'uploads' directory
+    },
+    filename: (req, file, cb) => {
+        cb(null, `${Date.now()}-${file.originalname}`);
+    },
+});
+const upload = multer({ storage });
 
 const reportController = {
     // Resident creates a report
     createReport: async (req, res) => {
         try {
-            const { locationAddress, locationLat, locationLng, description, photoUrl } = req.body;
+            const { locationAddress, locationLat, locationLng, description } = req.body;
+            const photoUrl = req.file ? `/uploads/${req.file.filename}` : null; // Get uploaded file URL
+
             if (!locationAddress || locationLat === undefined || locationLng === undefined || !description) {
                 return res.status(400).json({ message: 'Missing report fields' });
             }
@@ -21,7 +36,7 @@ const reportController = {
                 locationLat: lat,
                 locationLng: lng,
                 description,
-                photoUrl: photoUrl || null,
+                photoUrl,
             });
 
             await report.save();
@@ -120,3 +135,4 @@ const reportController = {
 };
 
 module.exports = reportController;
+module.exports.upload = upload.single('photo'); // Export the multer upload middleware

@@ -1,12 +1,18 @@
 const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
 const User = require('../models/User');
 const Collector = require('../models/Collector');
 const Booking = require('../models/Booking');
 const Report = require('../models/Report');
+const { sendOtp } = require('../utils/twoFactor');
+
+function generateCode() {
+    return Math.floor(100000 + Math.random() * 900000).toString();
+}
 
 const adminController = {
-  // Admin creates a collector (creates both User and Collector records)
+  // Admin creates a collector (sends verification email, user created after verification)
   createCollector: async (req, res) => {
     try {
       console.log('Admin create collector payload:', req.body);
@@ -41,72 +47,47 @@ const adminController = {
       console.log('Resolved username to use for new user:', username, 'requestedUsername:', requestedUsername);
 
       const salt = await bcrypt.genSalt(10);
-      const hashed = await bcrypt.hash(password, salt);
+      const hashedPassword = await bcrypt.hash(password, salt);
+      const code = generateCode();
+      const hashedCode = await bcrypt.hash(code, 10);
 
-      const user = new User({
-        username: username,
+      // Prepare user data (don't save yet)
+      const userData = {
+        username,
         email,
-        password: hashed,
+        password: hashedPassword,
         fullName,
         phone: phone || '',
-        roles: ['collector']
-      });
+        roles: ['collector'],
+        twoFactorEnabled: false,
+        twoFactorMethod: 'email',
+        isVerified: true, // Will be set to true after verification
+        vehicleNumber: vehicleNumber || undefined,
+        vehicleType: vehicleType || undefined
+      };
 
-      console.log('About to save user object:', { username: user.username, email: user.email, fullName: user.fullName, roles: user.roles });
-
+      // Send OTP
       try {
-        await user.save();
-      } catch (saveErr) {
-        console.error('Error saving new user:', saveErr && saveErr.stack ? saveErr.stack : saveErr);
-        // give a clearer error to the client
-        return res.status(500).json({ message: 'Server error', error: saveErr.message || String(saveErr) });
-      }
-      // Ensure roles explicitly set to collector (avoid schema coercion)
-      try {
-        await User.findByIdAndUpdate(user._id, { roles: ['collector'] });
-        const reloaded = await User.findById(user._id).select('-password');
-        console.log('Created user (after enforce roles):', reloaded);
+        await sendOtp({ email }, code, 'email');
       } catch (e) {
-        console.error('Failed to enforce collector role on created user:', e && e.message ? e.message : e);
-      }
-      let collector;
-      try {
-        collector = new Collector({
-          userId: user._id,
-          fullName: fullName || user.fullName || '',
-          username: user.username,
-          email: user.email,
-          phone: phone || user.phone || '',
-          vehicleNumber,
-          vehicleType: vehicleType || '',
-          isAvailable: true
-        });
-
-        await collector.save();
-      } catch (err) {
-        console.error('Collector save error:', err && err.stack ? err.stack : err);
-        // If duplicate collector (unique userId) return conflict
-        if (err && err.name === 'MongoServerError' && err.code === 11000) {
-          return res.status(409).json({ message: 'Collector already exists for this user' });
-        }
-        // Remove created user to avoid orphaned user if collector creation fails
-        try { await User.findByIdAndDelete(user._id); } catch (e) { console.error('Failed to cleanup user after collector save failure', e); }
-        return res.status(500).json({ message: 'Failed to create collector', error: err.message || String(err) });
+        console.error('Failed to send OTP for new collector:', e && e.message ? e.message : e);
+        return res.status(500).json({ message: 'Failed to send verification email' });
       }
 
-      const created = await Collector.findById(collector._id).populate('userId', 'fullName email phone username roles');
+      // Create temp token with user data and verification code
+      const tempToken = jwt.sign({ 
+        twoFactor: true, 
+        userData,
+        verificationCode: hashedCode,
+        expires: Date.now() + 5 * 60 * 1000 // 5 minutes
+      }, process.env.JWT_SECRET, { expiresIn: '10m' });
 
-      // Also include the user object explicitly for convenience
-      const userObj = created.userId ? {
-        id: created.userId._id,
-        username: created.userId.username,
-        email: created.userId.email,
-        fullName: created.userId.fullName,
-        phone: created.userId.phone,
-        roles: created.userId.roles
-      } : null;
-
-      res.status(201).json({ collector: created, user: userObj });
+      res.status(200).json({ 
+        twoFactorRequired: true, 
+        tempToken, 
+        twoFactorMethod: 'email',
+        message: 'Collector verification email sent. User will be created after verification.' 
+      });
     } catch (error) {
       console.error('Admin create collector error:', error && error.stack ? error.stack : error);
       res.status(500).json({ message: 'Server error', error: error.message || String(error) });
@@ -138,6 +119,7 @@ const adminController = {
       const filter = {};
       if (role) filter.roles = role;
       const users = await User.find(filter).select('-password');
+      res.set('Cache-Control', 'no-cache');
       res.json(users);
     } catch (error) {
       console.error('Admin get users error:', error);
@@ -199,6 +181,87 @@ const adminController = {
       }
     } catch (error) {
       console.error('Admin delete user error:', error);
+      res.status(500).json({ message: 'Server error', error: error.message });
+    }
+  }
+  ,
+  // Get admin statistics about bookings/tasks
+  getStats: async (req, res) => {
+    try {
+      const totalBookings = await Booking.countDocuments();
+      const totalCompleted = await Booking.countDocuments({ status: 'completed' });
+
+      // Completed today
+      const startOfToday = new Date();
+      startOfToday.setHours(0,0,0,0);
+      const completedToday = await Booking.countDocuments({ status: 'completed', completedAt: { $gte: startOfToday } });
+
+      // Report stats
+      const totalReports = await Report.countDocuments();
+      const totalClearedReports = await Report.countDocuments({ status: 'cleared' });
+
+      // Completed by collector (top 10)
+      const byCollector = await Booking.aggregate([
+        { $match: { status: 'completed', collectorId: { $ne: null } } },
+        { $group: { _id: '$collectorId', count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+        { $limit: 20 }
+      ]);
+
+      // Populate collector details
+      const collectorsStats = await Promise.all(byCollector.map(async (row) => {
+        const collector = await Collector.findById(row._id).populate('userId', 'fullName email');
+        return {
+          collectorId: row._id,
+          name: collector?.userId?.fullName || collector?.username || null,
+          vehicleNumber: collector?.vehicleNumber || null,
+          count: row.count
+        };
+      }));
+
+      // Completed by day (last N days) for bookings
+      const days = parseInt(req.query.days || '14', 10) || 14;
+      const since = new Date(Date.now() - (days * 24 * 60 * 60 * 1000));
+      const byDayBookings = await Booking.aggregate([
+        { $match: { status: 'completed', completedAt: { $gte: since } } },
+        { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$completedAt' } }, count: { $sum: 1 } } },
+        { $sort: { _id: 1 } }
+      ]);
+
+      // Cleared by day for reports
+      const byDayReports = await Report.aggregate([
+        { $match: { status: 'cleared', clearedAt: { $gte: since } } },
+        { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$clearedAt' } }, count: { $sum: 1 } } },
+        { $sort: { _id: 1 } }
+      ]);
+
+      // Combine for bar graph
+      const combinedByDay = {};
+      byDayBookings.forEach(item => {
+        combinedByDay[item._id] = { date: item._id, bookings: item.count, reports: 0 };
+      });
+      byDayReports.forEach(item => {
+        if (combinedByDay[item._id]) {
+          combinedByDay[item._id].reports = item.count;
+        } else {
+          combinedByDay[item._id] = { date: item._id, bookings: 0, reports: item.count };
+        }
+      });
+      const byDayCombined = Object.values(combinedByDay).sort((a, b) => a.date.localeCompare(b.date));
+
+      res.json({ 
+        totalBookings, 
+        totalCompleted, 
+        completedToday, 
+        totalReports, 
+        totalClearedReports,
+        collectorsStats, 
+        byDayBookings, 
+        byDayReports,
+        byDayCombined 
+      });
+    } catch (error) {
+      console.error('Admin getStats error:', error);
       res.status(500).json({ message: 'Server error', error: error.message });
     }
   }

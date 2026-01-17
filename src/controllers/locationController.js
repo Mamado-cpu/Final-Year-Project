@@ -32,6 +32,17 @@ const locationController = {
                 isOnline: true
             });
 
+            // If socket.io is enabled, broadcast the update
+            try {
+                const io = req.app.get('io');
+                if (io) {
+                    io.to('residents').emit('collector:update', { collectorId: collector._id.toString(), latitude, longitude, timestamp: timestamp || new Date().toISOString(), isOnline: true, vehicleNumber: collector.vehicleNumber, vehicleType: collector.vehicleType });
+                    io.to('admins').emit('collector:update', { collectorId: collector._id.toString(), latitude, longitude, timestamp: timestamp || new Date().toISOString(), isOnline: true, vehicleNumber: collector.vehicleNumber, vehicleType: collector.vehicleType });
+                }
+            } catch (e) {
+                console.warn('Socket broadcast failed', e);
+            }
+
             res.json({ message: 'Location updated successfully' });
         } catch (error) {
             console.error('Location update error:', error);
@@ -159,11 +170,48 @@ const locationController = {
         }
     },
 
+    // Get nearby collectors for a resident: ?lat=..&lng=..&radiusMeters=..
+    getNearbyCollectors: async (req, res) => {
+        try {
+            const lat = parseFloat(req.query.lat);
+            const lng = parseFloat(req.query.lng);
+            const radius = parseInt(req.query.radiusMeters || req.query.radius || '1000', 10); // meters
+
+            if (!lat || !lng) return res.status(400).json({ message: 'lat and lng required' });
+
+            // Use simple distance calculation from stored currentLat/currentLng
+            const collectors = await Collector.find({ isAvailable: true, currentLat: { $ne: null }, currentLng: { $ne: null } }).populate('userId', 'fullName phone email');
+            const resArr = [];
+            const toRad = (x) => x * Math.PI / 180;
+            const R = 6371000;
+            collectors.forEach(c => {
+                try {
+                    const dLat = toRad(c.currentLat - lat);
+                    const dLon = toRad(c.currentLng - lng);
+                    const a = Math.sin(dLat/2) * Math.sin(dLat/2) + Math.cos(toRad(lat)) * Math.cos(toRad(c.currentLat)) * Math.sin(dLon/2) * Math.sin(dLon/2);
+                    const d = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)) * R;
+                    if (d <= radius) {
+                        resArr.push({ collectorId: c._id, name: c.userId?.fullName, phone: c.userId?.phone, latitude: c.currentLat, longitude: c.currentLng, distanceMeters: Math.round(d), vehicleNumber: c.vehicleNumber, vehicleType: c.vehicleType });
+                    }
+                } catch (e) {}
+            });
+
+            res.json(resArr.sort((a,b)=>a.distanceMeters-b.distanceMeters));
+        } catch (error) {
+            console.error('getNearbyCollectors error:', error);
+            res.status(500).json({ message: 'Server error', error: error.message });
+        }
+    },
+
     // Mark collector as offline
     goOffline: async (req, res) => {
         try {
             const collectorId = req.user._id;
             await locationService.removeCollectorLocation(collectorId.toString());
+            try {
+                const io = req.app.get('io');
+                if (io) io.to('residents').emit('collector:update', { collectorId: collectorId.toString(), isOnline: false });
+            } catch (e) { }
             res.json({ message: 'Successfully marked as offline' });
         } catch (error) {
             res.status(500).json({ message: 'Server error', error: error.message });
@@ -179,24 +227,30 @@ const locationController = {
             
             // Get real-time locations from MongoDB
             const realtimeLocations = await locationService.getAllCollectorLocations();
+            console.log('[admin] collectors total:', collectors.length);
+            const realtimeCount = realtimeLocations ? Object.keys(realtimeLocations).length : 0;
+            console.log('[admin] realtime locations count:', realtimeCount);
             
             // Combine MongoDB data
-            const detailedLocations = collectors.map(collector => ({
-                collectorId: collector._id,
-                userId: collector.userId?._id,
-                name: collector.userId.fullName,
-                phone: collector.userId.phone,
-                email: collector.userId.email,
-                vehicleNumber: collector.vehicleNumber,
-                vehicleType: collector.vehicleType,
-                isAvailable: collector.isAvailable,
-                lastKnownLocation: {
-                    latitude: collector.currentLat,
-                    longitude: collector.currentLng,
-                    timestamp: collector.lastLocationUpdate
-                },
-                realtimeLocation: realtimeLocations?.[collector._id.toString()]
-            }));
+            const detailedLocations = collectors
+                .filter(collector => collector.userId) // Only include collectors with valid userId
+                .map(collector => ({
+                    collectorId: collector._id,
+                    userId: collector.userId?._id,
+                    name: collector.userId?.fullName || 'Unknown',
+                    phone: collector.userId?.phone || 'Unknown',
+                    email: collector.userId?.email || 'Unknown',
+                    vehicleNumber: collector.vehicleNumber,
+                    vehicleType: collector.vehicleType,
+                    isAvailable: collector.isAvailable,
+                    lastKnownLocation: {
+                        latitude: collector.currentLat,
+                        longitude: collector.currentLng,
+                        timestamp: collector.lastLocationUpdate
+                    },
+                    realtimeLocation: realtimeLocations?.[collector._id.toString()]
+                }));
+            console.log('[admin] detailedLocations count:', detailedLocations.length);
 
             res.json(detailedLocations);
         } catch (error) {
